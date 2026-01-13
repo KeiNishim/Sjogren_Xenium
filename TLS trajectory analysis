@@ -1,0 +1,253 @@
+1) Average expression by cluster_name (SCT)
+Idents(s.sub) <- "cluster_name"
+DefaultAssay(s.sub) <- "SCT"
+
+avg_expression <- AverageExpression(s.sub, group.by = "cluster_name", assays = "SCT")
+expr_data <- avg_expression$SCT # rows: genes, cols: cluster_name
+expr_matrix <- t(expr_data) # rows: cluster_name, cols: genes
+
+(Optional) If you need sample/disease majority per cluster (from cell-level meta)
+majority_by <- function(x) {
+ux <- unique(x)
+ux[which.max(tabulate(match(x, ux)))]
+}
+cluster_majority <- s.sub@meta.data %>%
+group_by(cluster_name) %>%
+summarise(
+sample_majority = majority_by(sample),
+disease_majority = majority_by(disease),
+.groups = "drop"
+)
+
+2) Feature selection and UMAP
+gene_vars <- apply(expr_data, 1, var)
+genes_to_keep <- names(sort(gene_vars, decreasing = TRUE)[1:min(300, length(gene_vars))])
+expr_matrix_sel <- expr_matrix[, genes_to_keep, drop = FALSE]
+
+umap_result <- umap(expr_matrix_sel, n_neighbors = 5, min_dist = 0.2)
+umap_df <- data.frame(
+UMAP1 = umap_result$layout[, 1],
+UMAP2 = umap_result$layout[, 2],
+cluster_name = rownames(expr_matrix_sel),
+stringsAsFactors = FALSE
+)
+
+Attach majority sample/disease (optional)
+umap_df <- umap_df %>%
+left_join(cluster_majority, by = "cluster_name")
+
+3) K-means on UMAP and labeling
+set.seed(1234)
+km <- kmeans(umap_df[, c("UMAP1", "UMAP2")], centers = 6, iter.max = 50, nstart = 50)
+umap_df$km_cluster <- km$cluster
+
+Map numeric clusters to semantic categories (adjust as needed)
+name_map <- data.frame(
+old = c(2, 6, 5, 4, 3, 1),
+new = c("Immune_Aggregate", "Immune_Aggregate", "TLS_Maturating", "TLS_Maturating",
+"IgG_Producing", "IgA_Producing")
+)
+umap_df$cluster_category <- name_map$new[match(umap_df$km_cluster, name_map$old)]
+
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = factor(cluster_category))) +
+geom_point(size = 3) +
+theme_minimal() +
+labs(title = "UMAP clustering (cluster_name means)", color = "Category")
+print(p_umap)
+
+4) Slingshot pseudotime on UMAP points
+sds <- slingshot(
+data = umap_df[, c("UMAP1", "UMAP2")],
+clusterLabels = umap_df$cluster_category,
+start.clus = NULL,
+extend = "y",
+stretch = 0.8
+)
+
+lines <- SlingshotDataSet(sds)
+curves <- slingCurves(lines)
+
+Plot all curves (example: first curve)
+p_curve <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = factor(cluster_category))) +
+geom_point(size = 3) +
+theme_minimal() +
+ggtitle("UMAP with Slingshot Trajectory")
+curve_data_1 <- curves[[1]]$s
+curve_df_1 <- data.frame(UMAP1 = curve_data_1[, 1], UMAP2 = curve_data_1[, 2])
+p_curve <- p_curve + geom_path(data = curve_df_1, aes(x = UMAP1, y = UMAP2),
+inherit.aes = FALSE, color = "black", linewidth = 0.5)
+print(p_curve)
+
+Ordered trajectory (example: curve 2 if exists)
+if (length(curves) >= 2) {
+curve_data <- curves[[2]]$s
+curve_order <- curves[[2]]$ord
+ordered_curve <- curve_data[curve_order, ]
+curve_df <- data.frame(UMAP1 = ordered_curve[, 1], UMAP2 = ordered_curve[, 2])
+
+p_curve2 <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = factor(cluster_category))) +
+geom_point(size = 3) +
+geom_path(data = curve_df, aes(x = UMAP1, y = UMAP2),
+inherit.aes = FALSE, color = "red", linewidth = 1.5) +
+theme_minimal() +
+ggtitle("UMAP with ordered trajectory (curve 2)")
+print(p_curve2)
+}
+
+Extract pseudotime (coalesce across curves)
+pt <- slingPseudotime(sds)
+umap_df$pseudotime1 <- if (ncol(pt) >= 1) pt[, 1] else NA
+umap_df$pseudotime2 <- if (ncol(pt) >= 2) pt[, 2] else NA
+umap_df$pseudotime <- dplyr::coalesce(umap_df$pseudotime1, umap_df$pseudotime2)
+
+Loess-smoothed trajectory (using pseudotime1 where available)
+df_clean <- umap_df %>%
+filter(is.finite(pseudotime1), is.finite(UMAP1), is.finite(UMAP2))
+if (nrow(df_clean) > 5) {
+lo1 <- loess(UMAP1 ~ pseudotime1, data = df_clean, span = 0.6, degree = 2)
+lo2 <- loess(UMAP2 ~ pseudotime1, data = df_clean, span = 0.6, degree = 2)
+t_seq <- seq(min(df_clean$pseudotime1), max(df_clean$pseudotime1), length.out = 200)
+traj_df <- data.frame(
+pseudotime1 = t_seq,
+UMAP1 = predict(lo1, newdata = data.frame(pseudotime1 = t_seq)),
+UMAP2 = predict(lo2, newdata = data.frame(pseudotime1 = t_seq))
+)
+p_loess <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = pseudotime1)) +
+geom_point(size = 3) +
+
+geom_path(data = traj_df, aes(x = UMAP1, y = UMAP2),
+inherit.aes = FALSE, color = "black", linewidth = 1.0) +
+scale_color_viridis_c(option = "plasma") +
+theme_classic() +
+ggtitle("Pseudotime trajectory (loess-smoothed)")
+print(p_loess)
+}
+
+Optional: conditional replacements (adjust thresholds as needed)
+umap_df <- umap_df %>%
+mutate(
+pseudotime1 = if_else(UMAP1 < 1.25, dplyr::coalesce(pseudotime1, pseudotime2), pseudotime1),
+pseudotime2 = if_else(UMAP2 > 1.5, dplyr::coalesce(pseudotime1, pseudotime2), pseudotime2)
+)
+
+Optional: invert pseudotime (if needed for specific tissue)
+if (all(is.finite(umap_df$pseudotime))) {
+umap_df$pseudotime <- max(umap_df$pseudotime) - umap_df$pseudotime
+}
+
+5) Clean cluster_name for joining
+umap_df$name_clean <- sub("^(C\d+[a-z]).", "\1", umap_df$cluster_name)
+umap_df_sorted <- umap_df[order(umap_df$pseudotime1), ]
+
+6) Single-gene overlay on UMAP (cluster-level average)
+gene_of_interest <- "CXCL9"
+stopifnot(gene_of_interest %in% rownames(expr_data))
+df_expr <- data.frame(
+cluster_name = colnames(expr_data),
+expr = as.numeric(expr_data[gene_of_interest, colnames(expr_data), drop = TRUE]),
+stringsAsFactors = FALSE
+)
+umap_with_expr <- umap_df %>%
+left_join(df_expr, by = "cluster_name")
+
+p_expr_umap <- ggplot(umap_with_expr, aes(x = UMAP1, y = UMAP2, color = expr)) +
+geom_point(size = 3) +
+scale_color_viridis_c(option = "plasma", na.value = "grey85") +
+coord_equal() +
+theme_minimal(base_size = 14) +
+labs(color = gene_of_interest, title = paste0("UMAP colored by ", gene_of_interest, " expression"))
+print(p_expr_umap)
+
+7) Correlation with pseudotime and top genes selection
+Reorder expression columns by pseudotime order (match by cluster_name)
+expr_data_reordered <- expr_data[, umap_df_sorted$cluster_name, drop = FALSE]
+
+Filter genes with non-zero SD
+non_zero_sd <- apply(expr_data_reordered, 1, sd) > 0
+expr_data_filtered <- expr_data_reordered[non_zero_sd, , drop = FALSE]
+
+cor_results <- apply(expr_data_filtered, 1, function(x) {
+cor(x, umap_df_sorted$pseudotime1, use = "pairwise.complete.obs")
+})
+
+Keep positively correlated and take top 50 by magnitude
+cor_pos <- cor_results[cor_results > 0]
+top_genes <- names(sort(abs(cor_pos), decreasing = TRUE))[1:min(50, length(cor_pos))]
+expr_data_selected <- expr_data_reordered[top_genes, , drop = FALSE]
+
+8) Cluster composition proportions over pseudotime (Bcell/Tfh/FDC)
+cluster_props <- s.sub@meta.data %>%
+group_by(cluster_name, clusters) %>%
+summarise(count = n(), .groups = "drop") %>%
+tidyr::complete(cluster_name, clusters, fill = list(count = 0)) %>%
+group_by(cluster_name) %>%
+mutate(proportion = count / sum(count)) %>%
+ungroup()
+
+cluster_pseudotime <- umap_df %>%
+transmute(
+cluster_name = cluster_name,
+pseudotime1 = pseudotime1,
+pseudotime2 = pseudotime2,
+cluster_category = cluster_category
+)
+
+cluster_props <- cluster_props %>%
+left_join(cluster_pseudotime, by = "cluster_name")
+
+target_clusters <- c("Bcell", "Tfh", "FDC")
+cluster_props_long <- cluster_props %>%
+filter(clusters %in% target_clusters) %>%
+pivot_longer(cols = c(pseudotime1, pseudotime2),
+names_to = "pseudotime_type", values_to = "pseudotime")
+
+common_min <- min(cluster_props_long$pseudotime, na.rm = TRUE)
+common_max <- max(cluster_props_long$pseudotime, na.rm = TRUE)
+cluster_props_long <- cluster_props_long %>%
+filter(pseudotime >= common_min, pseudotime <= common_max)
+
+Clip proportions for beta regression
+eps <- 1e-5
+df_plot_gam <- cluster_props_long %>%
+mutate(proportion = pmin(pmax(proportion, eps), 1 - eps))
+
+Optional anchor weights near start
+anchor_xmax <- 0.1
+anchor_factor <- 500
+df_plot_gam_w <- df_plot_gam %>%
+mutate(weight = ifelse(pseudotime <= anchor_xmax, anchor_factor, 1))
+
+k_less_wavy <- 5
+gamma_smooth <- 0.67
+
+p_less_wavy_lines <- ggplot(
+df_plot_gam_w,
+aes(x = pseudotime, y = proportion, color = pseudotime_type, fill = pseudotime_type)
+) +
+geom_smooth(
+aes(weight = weight),
+method = "gam",
+formula = y ~ s(x, k = k_less_wavy, bs = "tp"),
+method.args = list(
+family = mgcv::betar(link = "logit"),
+method = "REML",
+select = TRUE,
+gamma = gamma_smooth
+),
+se = TRUE, alpha = 0.3
+) +
+labs(x = "Pseudotime", y = "Population") +
+theme_classic() +
+theme(
+text = element_text(size = 15),
+axis.text = element_text(size = 15),
+legend.text = element_text(size = 15),
+plot.title = element_text(size = 15),
+strip.background = element_blank()
+) +
+scale_color_manual(values = c("pseudotime1" = "orange", "pseudotime2" = "forestgreen"), drop = FALSE) +
+scale_fill_manual(values = c("pseudotime1" = "orange", "pseudotime2" = "forestgreen"), drop = FALSE) +
+scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0.02, 0.05))) +
+facet_wrap(~clusters, scales = "free_y", ncol = 5)
+
+print(p_less_wavy_lines)
