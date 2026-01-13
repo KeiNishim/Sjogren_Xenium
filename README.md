@@ -16,4 +16,4 @@ Tsujimoto K, Nishimura K, et al, "Spatial organization of tertiary lymphoid stru
 ・slingshot (v2.12.0)
 
 ## Data availability
-Spatial transcriptomic data are available in Zenodo with accession codes [10.5281/zenodo.18229261]
+Spatial transcriptomic data are available in Zenodo with accession codes [10.5281/zenodo.18230900]
